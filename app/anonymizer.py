@@ -377,16 +377,23 @@ class Anonymizer:
 
     # ----- 单文件匿名化 ----------------------------------------------------- #
     def _ensure_top_level_uids(self, ds: Dataset, report: FileReport) -> None:
-        """补齐顶层必需 UID，缺失时生成确定性 UID 并给出诊断。"""
+        """补齐顶层必需 UID，缺失时生成确定性 UID 并给出诊断。
+
+        统一按标签“值”判断缺失：标签不存在与标签存在但值为空（含全空白）
+        走同一条确定性补齐路径。若只判断标签是否存在，空值会流入全局重写
+        （``mapped_uid`` 拒绝空 UID，文件报 WRITE_ERROR），或在匿名输出与
+        任务索引中留下空 UID。
+        """
         for keyword, tag_, code in (
             ("StudyInstanceUID", Tag(0x0020000D), "MISSING_STUDY_UID"),
             ("SeriesInstanceUID", Tag(0x0020000E), "MISSING_SERIES_UID"),
             ("SOPInstanceUID", Tag(0x00080018), "MISSING_SOP_UID"),
         ):
-            if str(ds.get(tag_, "") or "").strip():
+            if str(getattr(ds, keyword, "") or "").strip():
                 continue
             placeholder = f"missing:{keyword.lower()}:{self._missing_seed}"
             new_uid = crypto.derive_uid(self.secret, placeholder)
+            # 标签已存在（空值）时 add_new 直接覆盖该元素
             ds.add_new(tag_, "UI", new_uid)
             # 生成的新 UID 映射到自身，保持后续映射表一致
             self._uid_map[placeholder] = new_uid
@@ -395,7 +402,7 @@ class Anonymizer:
                 Diagnostic(
                     code,
                     "warning",
-                    f"缺少 {keyword}，已生成确定性替代 UID：{new_uid}",
+                    f"{keyword} 缺失或值为空，已生成确定性替代 UID：{new_uid}",
                 )
             )
 
@@ -688,15 +695,12 @@ class Anonymizer:
                                             "REPLACE", _preview(old_pname),
                                             patient.new_patient_name, "/"))
 
+                # _ensure_top_level_uids 已保证三者非空（缺失/空值已按确定性
+                # 规则补齐），统一参与全局映射重写；补齐生成的 UID 在映射表中
+                # 登记为恒等映射，重写后保持原值
                 new_sop = self.mapped_uid(orig_sop)
-                if orig_study:
-                    new_study = self.mapped_uid(orig_study)
-                else:
-                    new_study = str(ds.StudyInstanceUID)
-                if orig_series:
-                    new_series = self.mapped_uid(orig_series)
-                else:
-                    new_series = str(ds.SeriesInstanceUID)
+                new_study = self.mapped_uid(orig_study)
+                new_series = self.mapped_uid(orig_series)
 
                 # 文件元信息（先处理；与主数据集走同一套映射）
                 if ds.file_meta is not None:

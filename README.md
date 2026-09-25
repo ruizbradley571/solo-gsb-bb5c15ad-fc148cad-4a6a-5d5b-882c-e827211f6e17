@@ -1402,7 +1402,7 @@ else:
 | `READ_ERROR` | error | 文件截断或标签编码损坏，无法解析 |
 | `WRITE_ERROR` | error | 匿名化写出阶段异常 |
 | `DANGLING_REFERENCE` | warning | 序列引用的 SOP 实例不在 ZIP 内（引用仍一致重写） |
-| `MISSING_STUDY_UID` / `MISSING_SERIES_UID` / `MISSING_SOP_UID` | warning | 顶层 UID 缺失，已生成确定性替代 UID |
+| `MISSING_STUDY_UID` / `MISSING_SERIES_UID` / `MISSING_SOP_UID` | warning | 顶层 UID 标签缺失或值为空，已生成确定性替代 UID |
 | `INVALID_DATE` | warning | DA/DT 值无法解析，已清空 |
 | `PATIENT_IDENTITY_FALLBACK` | warning | 缺少 PatientID/Name，按 Study UID 或文件内容归组 |
 | `DUPLICATE_SOP_INSTANCE` | warning | 多个文件共享同一 SOP UID，输出文件自动改名 |
@@ -1444,6 +1444,12 @@ else:
   `ReferencedFrameOfReferenceSequence` 等任何深度，都与被引用实例的新 UID 一致。
 - `SOPClassUID`、`TransferSyntaxUID` 等**类型性 UID 不重写**（重写会破坏文件语义）；
   文件元信息 `MediaStorageSOPInstanceUID` 与顶层 `SOPInstanceUID` 保持一致。
+- 顶层 `StudyInstanceUID` / `SeriesInstanceUID` / `SOPInstanceUID` **标签缺失或
+  标签存在但值为空**（含全空白）时统一按缺失处理：先按确定性规则（稳定密钥 +
+  文件内容哈希派生）补齐替代 UID——同一文件跨批次补齐结果相同——再参与全局
+  一致性重写，并逐文件给出 `MISSING_*_UID` 警告。因此匿名文件顶层 UID、
+  File Meta 的 `MediaStorageSOPInstanceUID`、任务结果中的检查/系列/实例索引与
+  下载 ZIP 文件名始终一致，不会因空值 UID 报 `WRITE_ERROR` 或在输出中留下空 UID。
 - 匿名 ZIP 内文件按**新 SOPInstanceUID 扁平命名**，不含原始路径。
 
 **安全**
@@ -1501,7 +1507,7 @@ else:
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
 │   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览/几何/KVP/剂量事件/SEG 覆盖率错误模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何 / 系列 KVP 分布 / 剂量 SR 照射事件 / SEG 分割覆盖率 / ZIP 同名条目（308 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何 / 系列 KVP 分布 / 剂量 SR 照射事件 / SEG 分割覆盖率 / ZIP 同名条目 / 空值顶层 UID（322 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

@@ -591,3 +591,127 @@ def test_same_name_same_sop_uses_duplicate_rule(tmp_path):
     dup = result.files[1]
     assert any(d.code == "DUPLICATE_SOP_INSTANCE" for d in dup.diagnostics)
     assert dup.status == "warning"
+
+
+# --------------------------------------------------------------------------- #
+# 顶层 UID 标签存在但值为空：统一按标签值判断缺失，确定性补齐后再参与全局重写
+# --------------------------------------------------------------------------- #
+def _ct_uid_variants(sop, study, series, ref_sop=None):
+    """构造 CT 文件；三类顶层 UID 传 None 表示不写标签，传 "" 表示标签存在但值为空。"""
+    from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+    from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian
+
+    fm = FileMetaDataset()
+    fm.MediaStorageSOPClassUID = CTImageStorage
+    fm.MediaStorageSOPInstanceUID = sop or "1.9.9.9"  # 占位，引擎会覆盖为新 SOP UID
+    fm.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds = FileDataset(None, {}, file_meta=fm, preamble=b"\0" * 128)
+    ds.SOPClassUID = CTImageStorage
+    ds.PatientID = "P-001"
+    ds.PatientName = "Zhang^San"
+    ds.Modality = "CT"
+    for tag_, value in ((0x00080018, sop), (0x0020000D, study), (0x0020000E, series)):
+        if value is not None:
+            ds.add_new(tag_, "UI", value)
+    if ref_sop is not None:
+        item = Dataset()
+        item.ReferencedSOPClassUID = CTImageStorage
+        item.ReferencedSOPInstanceUID = ref_sop
+        ds.ReferencedSOPSequence = [item]
+    buf = io.BytesIO()
+    ds.save_as(buf, enforce_file_format=True)
+    return buf.getvalue()
+
+
+def test_empty_value_top_level_uids_filled_like_missing(tmp_path):
+    """三类顶层 UID 标签存在但值为空：视同缺失确定性补齐，不再 WRITE_ERROR / 空 UID。"""
+    ex, entries = _extract_members(
+        tmp_path, [("empty.dcm", _ct_uid_variants("", "", ""))], tag="empty"
+    )
+    result = Anonymizer(secret=SECRET).run(ex, entries, str(tmp_path / "out"))
+
+    rep = result.files[0]
+    assert rep.status == "warning"
+    codes = {d.code for d in rep.diagnostics}
+    assert {"MISSING_STUDY_UID", "MISSING_SERIES_UID", "MISSING_SOP_UID"} <= codes
+    assert not any(d.severity == "error" for d in rep.diagnostics)
+    # 输出名为新 SOP UID，三级 UID 均为有效匿名 UID（无空串）
+    assert rep.output_name == f"{rep.sop_instance_uid}.dcm"
+    for uid in (rep.sop_instance_uid, rep.study_instance_uid, rep.series_instance_uid):
+        assert uid and uid.startswith("2.25.")
+    # 匿名文件顶层 UID、File Meta 与任务报告字段一致
+    ds = pydicom.dcmread(os.path.join(result.output_dir, rep.output_name))
+    assert ds.SOPInstanceUID == rep.sop_instance_uid
+    assert str(ds.file_meta.MediaStorageSOPInstanceUID) == rep.sop_instance_uid
+    assert ds.StudyInstanceUID == rep.study_instance_uid
+    assert ds.SeriesInstanceUID == rep.series_instance_uid
+    # 任务检查/系列/实例索引键与文件报告一致，无空键
+    assert set(result.studies) == {rep.study_instance_uid}
+    assert set(result.series) == {rep.series_instance_uid}
+    assert set(result.sops.values()) == {rep.sop_instance_uid}
+
+
+def test_empty_uid_replacement_deterministic_across_batches(tmp_path):
+    """空值 UID 的替代值由确定性规则派生：同一文件跨批次得到相同结果。"""
+    blob = _ct_uid_variants("", "", "")
+    ex1, e1 = _extract_members(tmp_path, [("a.dcm", blob)], tag="d1")
+    ex2, e2 = _extract_members(tmp_path, [("a.dcm", blob)], tag="d2")
+    r1 = Anonymizer(secret=SECRET).run(ex1, e1, str(tmp_path / "o1"))
+    r2 = Anonymizer(secret=SECRET).run(ex2, e2, str(tmp_path / "o2"))
+    got1, got2 = r1.files[0], r2.files[0]
+    assert (
+        got1.sop_instance_uid,
+        got1.study_instance_uid,
+        got1.series_instance_uid,
+    ) == (
+        got2.sop_instance_uid,
+        got2.study_instance_uid,
+        got2.series_instance_uid,
+    )
+
+
+def test_mixed_empty_missing_and_normal_uids(tmp_path):
+    """空值 / 缺失 / 正常 UID 混合：正常映射与嵌套引用不变，缺失项保留逐文件诊断。"""
+    from app import crypto
+
+    normal = _ct_uid_variants("1.7.7.100", "1.7.7.200", "1.7.7.300",
+                              ref_sop="1.7.7.100")
+    empty = _ct_uid_variants("", "", "")
+    missing = _ct_uid_variants(None, None, None)
+    ex, entries = _extract_members(
+        tmp_path,
+        [("normal.dcm", normal), ("empty.dcm", empty), ("missing.dcm", missing)],
+        tag="mixed",
+    )
+    result = Anonymizer(secret=SECRET).run(ex, entries, str(tmp_path / "out"))
+    by_name = {r.name: r for r in result.files}
+
+    # 正常文件：无 MISSING_* 诊断，三级 UID 按原有规则派生
+    normal_rep = by_name["normal.dcm"]
+    assert normal_rep.status == "ok"
+    assert not any(d.code.startswith("MISSING_") for d in normal_rep.diagnostics)
+    assert normal_rep.sop_instance_uid == crypto.derive_uid(SECRET, "1.7.7.100")
+    assert normal_rep.study_instance_uid == crypto.derive_uid(SECRET, "1.7.7.200")
+    assert normal_rep.series_instance_uid == crypto.derive_uid(SECRET, "1.7.7.300")
+    # 嵌套引用按同一映射表重写，不受同批次空值/缺失文件影响
+    ds = pydicom.dcmread(os.path.join(result.output_dir, normal_rep.output_name))
+    assert (
+        ds.ReferencedSOPSequence[0].ReferencedSOPInstanceUID
+        == normal_rep.sop_instance_uid
+    )
+
+    # 空值与缺失文件：各自保留逐文件 MISSING_* 诊断
+    for name in ("empty.dcm", "missing.dcm"):
+        rep = by_name[name]
+        assert rep.status == "warning"
+        codes = {d.code for d in rep.diagnostics}
+        assert {"MISSING_STUDY_UID", "MISSING_SERIES_UID", "MISSING_SOP_UID"} <= codes
+
+    # 全部成功写出；任务索引无空键；下载 ZIP 文件名与实例索引一致
+    assert all(r.output_name for r in result.files)
+    assert "" not in set(result.studies) | set(result.series) | set(result.sops)
+    zpath = build_zip(result, str(tmp_path / "anon.zip"))
+    with zipfile.ZipFile(zpath) as zf:
+        assert sorted(zf.namelist()) == sorted(
+            r.output_name for r in result.files
+        )
