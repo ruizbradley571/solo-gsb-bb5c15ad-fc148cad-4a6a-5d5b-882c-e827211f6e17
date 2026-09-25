@@ -377,16 +377,24 @@ class Anonymizer:
 
     # ----- 单文件匿名化 ----------------------------------------------------- #
     def _ensure_top_level_uids(self, ds: Dataset, report: FileReport) -> None:
-        """补齐顶层必需 UID，缺失时生成确定性 UID 并给出诊断。"""
+        """补齐顶层必需 UID，缺失（含标签存在但值为空/空白）时生成确定性 UID。
+
+        一律按**标签值**判断是否缺失：``ds.get(tag, "")`` 在标签存在但为空时
+        返回的是 DataElement 而非默认值，``str()`` 恒为真，因此不能用它判断；
+        通过属性取值（``getattr`` 对缺失标签返回 None，空值返回 ``""``）并做
+        strip，缺失标签与空值标签走同一条确定性补齐路径。
+        """
         for keyword, tag_, code in (
             ("StudyInstanceUID", Tag(0x0020000D), "MISSING_STUDY_UID"),
             ("SeriesInstanceUID", Tag(0x0020000E), "MISSING_SERIES_UID"),
             ("SOPInstanceUID", Tag(0x00080018), "MISSING_SOP_UID"),
         ):
-            if str(ds.get(tag_, "") or "").strip():
+            existing = str(getattr(ds, keyword, None) or "").strip()
+            if existing:
                 continue
             placeholder = f"missing:{keyword.lower()}:{self._missing_seed}"
             new_uid = crypto.derive_uid(self.secret, placeholder)
+            # add_new 会先删除同标签元素，因此“存在但为空”的元素同样被替换
             ds.add_new(tag_, "UI", new_uid)
             # 生成的新 UID 映射到自身，保持后续映射表一致
             self._uid_map[placeholder] = new_uid
@@ -395,7 +403,7 @@ class Anonymizer:
                 Diagnostic(
                     code,
                     "warning",
-                    f"缺少 {keyword}，已生成确定性替代 UID：{new_uid}",
+                    f"{keyword} 标签缺失或值为空，已生成确定性替代 UID：{new_uid}",
                 )
             )
 
@@ -689,14 +697,10 @@ class Anonymizer:
                                             patient.new_patient_name, "/"))
 
                 new_sop = self.mapped_uid(orig_sop)
-                if orig_study:
-                    new_study = self.mapped_uid(orig_study)
-                else:
-                    new_study = str(ds.StudyInstanceUID)
-                if orig_series:
-                    new_series = self.mapped_uid(orig_series)
-                else:
-                    new_series = str(ds.SeriesInstanceUID)
+                # 三类顶层 UID 已在上方按确定性规则补齐，orig_* 即（可能补齐后的）
+                # 原始侧 UID：先补齐再统一进全局映射，重写后与报告索引/输出文件名一致
+                new_study = self.mapped_uid(orig_study)
+                new_series = self.mapped_uid(orig_series)
 
                 # 文件元信息（先处理；与主数据集走同一套映射）
                 if ds.file_meta is not None:

@@ -1402,7 +1402,7 @@ else:
 | `READ_ERROR` | error | 文件截断或标签编码损坏，无法解析 |
 | `WRITE_ERROR` | error | 匿名化写出阶段异常 |
 | `DANGLING_REFERENCE` | warning | 序列引用的 SOP 实例不在 ZIP 内（引用仍一致重写） |
-| `MISSING_STUDY_UID` / `MISSING_SERIES_UID` / `MISSING_SOP_UID` | warning | 顶层 UID 缺失，已生成确定性替代 UID |
+| `MISSING_STUDY_UID` / `MISSING_SERIES_UID` / `MISSING_SOP_UID` | warning | 顶层 UID **标签缺失或标签存在但值为空（含仅空白）**，已生成确定性替代 UID |
 | `INVALID_DATE` | warning | DA/DT 值无法解析，已清空 |
 | `PATIENT_IDENTITY_FALLBACK` | warning | 缺少 PatientID/Name，按 Study UID 或文件内容归组 |
 | `DUPLICATE_SOP_INSTANCE` | warning | 多个文件共享同一 SOP UID，输出文件自动改名 |
@@ -1445,6 +1445,25 @@ else:
 - `SOPClassUID`、`TransferSyntaxUID` 等**类型性 UID 不重写**（重写会破坏文件语义）；
   文件元信息 `MediaStorageSOPInstanceUID` 与顶层 `SOPInstanceUID` 保持一致。
 - 匿名 ZIP 内文件按**新 SOPInstanceUID 扁平命名**，不含原始路径。
+
+**顶层 UID 标签存在但值为空（边界说明）**
+
+部分设备导出的 DICOM 会带上 `StudyInstanceUID` / `SeriesInstanceUID` /
+`SOPInstanceUID` 标签却把值留空（或只含空白）。服务**一律按标签值**判断这三类
+UID 是否缺失——“标签存在但为空/空白”与“标签完全缺失”同口径处理：
+
+1. 第二遍写出前先对每个文件按既有确定性规则补齐：以
+   `HMAC-SHA256(secret, "missing:<层级>:<文件内容哈希>")` 生成该文件专属的替代
+   UID（种子含文件内容，因此同输入跨批次稳定、不同文件互不相同），随后再与正常
+   UID 一样进入全局重写；逐文件结果保留 `MISSING_STUDY_UID` /
+   `MISSING_SERIES_UID` / `MISSING_SOP_UID` 警告，不会静默处理。
+2. 补齐后匿名文件的顶层 Study/Series/SOP UID、File Meta 的
+   `MediaStorageSOPInstanceUID`、任务结果中的检查/系列/实例索引与下载 ZIP 的
+   扁平文件名（`<SOPInstanceUID>.dcm`）四处一致，不再出现 `WRITE_ERROR` 或输出
+   空 UID 文件。
+3. 同一批文件混合包含**空值、缺失与正常 UID** 时：正常 UID 的原有映射及任意深度
+   的嵌套引用（`ReferencedSOPSequence`、RT `ContourImageSequence` 等）保持不变；
+   仅缺失/空值项按上条补齐并给出逐文件 `MISSING_*` 诊断。
 
 **安全**
 

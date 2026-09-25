@@ -591,3 +591,139 @@ def test_same_name_same_sop_uses_duplicate_rule(tmp_path):
     dup = result.files[1]
     assert any(d.code == "DUPLICATE_SOP_INSTANCE" for d in dup.diagnostics)
     assert dup.status == "warning"
+
+
+# --------------------------------------------------------------------------- #
+# 顶层 UID 标签存在但值为空（与标签缺失同口径处理）
+# --------------------------------------------------------------------------- #
+def _uid_case_dataset(sop: "str | None", study: "str | None",
+                      series: "str | None", *, ref_sop: "str | None" = None,
+                      media_sop: "str | None" = None) -> bytes:
+    """构造最小 DICOM。
+
+    None 表示**不写入标签**（标签缺失）；"" 表示**写入但值为空**；
+    其余字符串为正常 UID。用于覆盖“标签存在但值为空”这一历史误判边界。
+    """
+    from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+    from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian
+
+    fm = FileMetaDataset()
+    fm.MediaStorageSOPClassUID = CTImageStorage
+    fm.MediaStorageSOPInstanceUID = media_sop if media_sop is not None else "9.0.0.1"
+    fm.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds = FileDataset(None, {}, file_meta=fm, preamble=b"\0" * 128)
+    ds.SOPClassUID = CTImageStorage
+    if sop is not None:
+        ds.SOPInstanceUID = sop
+    if study is not None:
+        ds.StudyInstanceUID = study
+    if series is not None:
+        ds.SeriesInstanceUID = series
+    ds.PatientID = "P-1"
+    ds.PatientName = "Doe^X"
+    if ref_sop is not None:
+        item = Dataset()
+        item.ReferencedSOPClassUID = CTImageStorage
+        item.ReferencedSOPInstanceUID = ref_sop
+        ds.ReferencedSOPSequence = [item]
+    buf = io.BytesIO()
+    ds.save_as(buf, enforce_file_format=True)
+    return buf.getvalue()
+
+
+def _run_uids(tmp_path, members: dict, tag: str = "uids"):
+    zp = tmp_path / f"{tag}.zip"
+    with zipfile.ZipFile(zp, "w") as zf:
+        for name, blob in members.items():
+            zf.writestr(name, blob)
+    ex = tmp_path / f"{tag}-ex"
+    ex.mkdir()
+    entries = safe_extract_zip(str(zp), str(ex),
+                               settings.max_extracted_bytes,
+                               settings.max_extracted_files)
+    return Anonymizer(secret=SECRET).run(
+        str(ex), entries, str(tmp_path / f"{tag}-out"))
+
+
+def test_present_but_empty_uids_are_filled_like_absent(tmp_path):
+    """标签存在但值为空与标签缺失走同一确定性补齐路径，不再 WRITE_ERROR/空 UID。"""
+    result = _run_uids(tmp_path, {
+        "all_empty.dcm": _uid_case_dataset("", "", ""),
+        "all_absent.dcm": _uid_case_dataset(None, None, None),
+        "sop_empty.dcm": _uid_case_dataset("", "9.1.2", "9.1.3"),
+        "study_series_empty.dcm": _uid_case_dataset("9.2.1", "", ""),
+    })
+
+    expect_codes = {
+        "all_empty.dcm": {"MISSING_STUDY_UID", "MISSING_SERIES_UID", "MISSING_SOP_UID"},
+        "all_absent.dcm": {"MISSING_STUDY_UID", "MISSING_SERIES_UID", "MISSING_SOP_UID"},
+        "sop_empty.dcm": {"MISSING_SOP_UID"},
+        "study_series_empty.dcm": {"MISSING_STUDY_UID", "MISSING_SERIES_UID"},
+    }
+    by_name = {r.name: r for r in result.files}
+    for name, codes in expect_codes.items():
+        rep = by_name[name]
+        # 历史缺陷：空 SOP -> WRITE_ERROR；空 Study/Series -> 输出空 UID
+        assert rep.status == "warning", name
+        assert not any(d.code == "WRITE_ERROR" for d in rep.diagnostics), name
+        assert codes <= {d.code for d in rep.diagnostics}, name
+
+        out = pydicom.dcmread(os.path.join(result.output_dir, rep.output_name))
+        top = (str(out.StudyInstanceUID).strip(),
+               str(out.SeriesInstanceUID).strip(),
+               str(out.SOPInstanceUID).strip())
+        assert all(uid.startswith("2.25.") for uid in top), name
+        # 顶层 / File Meta / 任务索引 / 下载文件名四处一致
+        meta_sop = str(out.file_meta.MediaStorageSOPInstanceUID).strip()
+        assert meta_sop == top[2] == rep.sop_instance_uid, name
+        assert top[0] == rep.study_instance_uid, name
+        assert top[1] == rep.series_instance_uid, name
+        assert rep.output_name == f"{top[2]}.dcm", name
+        assert top[0] in result.studies and top[1] in result.series, name
+
+
+def test_empty_uid_fill_is_deterministic_per_file(tmp_path):
+    """同一输入包二次处理，空值补齐的 UID 与输出名完全一致（确定性规则）。"""
+    members = {"a.dcm": _uid_case_dataset("", "", ""),
+               "b.dcm": _uid_case_dataset(None, None, None)}
+    r1 = _run_uids(tmp_path, members, "run1")
+    r2 = _run_uids(tmp_path, members, "run2")
+    key = lambda r: sorted(
+        (x.name, x.study_instance_uid, x.series_instance_uid,
+         x.sop_instance_uid, x.output_name) for x in r.files)
+    assert key(r1) == key(r2)
+    # 两个不同文件即便三标签全缺/全空，也各自得到独立 UID（种子含文件哈希）
+    uids1 = {x.sop_instance_uid for x in r1.files}
+    assert len(uids1) == 2
+
+
+def test_mixed_empty_and_normal_uids_keep_normal_mapping(tmp_path):
+    """混合文件：正常 UID 的原有映射与嵌套引用不受空值补齐影响。"""
+    from app import crypto
+
+    result = _run_uids(tmp_path, {
+        # Study/Series 为空但 SOP 正常，且嵌套引用同批正常实例
+        "a_mixed.dcm": _uid_case_dataset(
+            "9.9.9.1", "", "", ref_sop="9.9.9.2"),
+        "b_normal.dcm": _uid_case_dataset(
+            "9.9.9.2", "9.9.9.10", "9.9.9.11"),
+    })
+    by_name = {r.name: r for r in result.files}
+    a, b = by_name["a_mixed.dcm"], by_name["b_normal.dcm"]
+
+    # 正常文件无任何 UID 缺失诊断，映射按既有确定性规则
+    assert b.status == "ok"
+    assert b.sop_instance_uid == crypto.derive_uid(SECRET, "9.9.9.2")
+    assert b.study_instance_uid == crypto.derive_uid(SECRET, "9.9.9.10")
+    assert b.series_instance_uid == crypto.derive_uid(SECRET, "9.9.9.11")
+    assert result.sops["9.9.9.2"] == b.sop_instance_uid
+
+    # 混合文件：正常 SOP 映射不变，空 Study/Series 逐文件诊断 + 补齐
+    assert a.sop_instance_uid == crypto.derive_uid(SECRET, "9.9.9.1")
+    assert {d.code for d in a.diagnostics} == {
+        "MISSING_STUDY_UID", "MISSING_SERIES_UID"}
+    out_a = pydicom.dcmread(os.path.join(result.output_dir, a.output_name))
+    # 嵌套引用仍重写到被引用正常实例的新 SOP（同一张全局映射表）
+    assert (out_a.ReferencedSOPSequence[0].ReferencedSOPInstanceUID
+            == b.sop_instance_uid)
+    assert a.output_name == f"{a.sop_instance_uid}.dcm"
